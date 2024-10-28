@@ -1,15 +1,12 @@
 import os
-import time
-from typing import Tuple
-import torch
-import numpy as np
-from tqdm import tqdm
-import torch.nn as nn
-import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader
+
 import imageio
-import nerfview
-import viser
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 
 @torch.no_grad()
@@ -59,7 +56,7 @@ def test(hn, hf, dataset, epoch, chunk_size=10, img_index=0, nb_bins=192, H=400,
         f"./novel_views/img_epoch_{epoch}_idx_{img_index}.png", bbox_inches="tight"
     )
     plt.close()
-    return img_loss
+    return img_loss, img
 
 
 class NerfModel(nn.Module):
@@ -184,51 +181,6 @@ def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=1
     return c + 1 - weight_sum.unsqueeze(-1)
 
 
-@torch.no_grad()
-def _viewer_render_fn(camera_state: nerfview.CameraState, img_wh: Tuple[int, int]):
-    chunk_size = 10
-    curr_device = "cuda"
-    W, H = img_wh
-    W = min(W, 400)
-    H = min(H, 400)
-    c2w = camera_state.c2w
-    K = camera_state.get_K(img_wh)
-    c2w = torch.from_numpy(c2w).float().to(curr_device)
-    K = torch.from_numpy(K).float().to(curr_device)
-
-    ray_origins = torch.zeros(H * W, 3, device=curr_device)
-    ray_directions = torch.zeros(H * W, 3, device=curr_device)
-
-    for i in range(H):
-        for j in range(W):
-            ray_origins[i * W + j, :] = c2w[:3, 3]
-            ray_directions[i * W + j, :] = torch.matmul(
-                torch.inverse(K), torch.tensor([j, i, 1.0], device=curr_device)
-            )
-    ray_directions = ray_directions / torch.norm(ray_directions, dim=1).unsqueeze(1)
-    print(ray_origins.shape, ray_directions.shape)
-    print(ray_origins[0], ray_directions[0])
-    data = []  # list of regenerated pixel values
-    for i in range(int(np.ceil(H / chunk_size))):  # iterate over chunks
-        # Get chunk of rays
-        ray_origins_ = ray_origins[i * W * chunk_size : (i + 1) * W * chunk_size].to(
-            curr_device
-        )
-        ray_directions_ = ray_directions[
-            i * W * chunk_size : (i + 1) * W * chunk_size
-        ].to(curr_device)
-        regenerated_px_values = render_rays(
-            model, ray_origins_, ray_directions_, hn=2, hf=6, nb_bins=192
-        )
-        data.append(regenerated_px_values)
-    img = torch.cat(data)
-    # Rescale to 0-255
-    img = (img - img.min()) / (img.max() - img.min() + 1e-5) * 255
-    print(img.shape)
-    print(img.max(), img.min())
-    return img.cpu().numpy().reshape(H, W, 3).astype(np.uint8)
-
-
 def train(
     nerf_model,
     optimizer,
@@ -239,23 +191,17 @@ def train(
     hf=1,
     nb_epochs=int(1e5),
     nb_bins=192,
-    H=400,
-    W=400,
-    viewer=None,
+    H=100,
+    W=100,
 ):
     training_loss = []
     log_interval = 100
-    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
     plt.show(block=False)
     # total_steps = nb_epochs * len(data_loader)
     curr_step = 0
     for epoch in tqdm(range(nb_epochs)):
         for batch_idx, batch in enumerate(data_loader):
-            while viewer.state.status == "paused":
-                time.sleep(0.01)
-            viewer.lock.acquire()
-            tic = time.time()
-
             ray_origins = batch[:, :3].to(device)
             ray_directions = batch[:, 3:6].to(device)
             ground_truth_px_values = batch[:, 6:].to(device)
@@ -271,23 +217,26 @@ def train(
             optimizer.step()
             training_loss.append(loss.item())
             curr_step += 1
-            # viewer.render_fn = functools.partial(
-            #     _viewer_render_fn, local_nerf_model=nerf_model
-            # )
-            viewer.lock.release()
-            num_train_steps_per_sec = 1.0 / (time.time() - tic)
-            num_train_rays_per_sec = nb_bins * num_train_steps_per_sec
-            # Update the viewer state.
-            viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
-            viewer.update(curr_step, nb_bins)
             if batch_idx % log_interval == 0:
                 print(f"Step: {batch_idx}, Loss: {loss.item()}")
+                _, test_img = test(
+                    hn,
+                    hf,
+                    testing_dataset,
+                    epoch,
+                    chunk_size=20,
+                    img_index=0,
+                    nb_bins=nb_bins,
+                    H=H,
+                    W=W,
+                )
                 # Plot the training loss
-                ax.clear()
-                ax.plot(training_loss, label="Training Loss")
-                ax.set_yscale("log")
-                ax.set_xlabel("Step")
-                ax.set_ylabel("Loss")
+                ax[0].clear()
+                ax[0].plot(training_loss, label="Training Loss")
+                ax[0].set_yscale("log")
+                ax[0].set_xlabel("Step")
+                ax[0].set_ylabel("Loss")
+                ax[1].imshow(test_img)
                 fig.canvas.draw()
                 fig.canvas.flush_events()
 
@@ -297,7 +246,7 @@ def train(
             f"./novel_views/testing_epoch_{epoch}.gif", mode="I"
         ) as writer:
             for img_index in tqdm(range(200)):
-                test_img_loss = test(
+                test_img_loss, _ = test(
                     hn,
                     hf,
                     testing_dataset,
@@ -331,26 +280,28 @@ def train(
 
 
 if __name__ == "__main__":
+    image_h = 100
+    image_w = 100
     device = "cuda"
     os.makedirs("./training_views", exist_ok=True)
     os.makedirs("./testing_views", exist_ok=True)
     os.makedirs("./novel_views", exist_ok=True)
     training_dataset = torch.from_numpy(
-        np.load("./nerf_datasets/training_data.pkl", allow_pickle=True)
-    )
+        np.load("./training_data.npz", allow_pickle=True)["data"]
+    ).float()
     testing_dataset = torch.from_numpy(
-        np.load("./nerf_datasets/testing_data.pkl", allow_pickle=True)
-    )
-    nb_train_frames = training_dataset.shape[0] // 400 // 400
-    nb_test_frames = testing_dataset.shape[0] // 400 // 400
+        np.load("./training_data.npz", allow_pickle=True)["data"]
+    ).float()
+    nb_train_frames = training_dataset.shape[0] // image_h // image_w
+    nb_test_frames = testing_dataset.shape[0] // image_h // image_w
     print(f"Number of training frames: {nb_train_frames}")
     print(f"Number of testing frames: {nb_test_frames}")
     # Save training images
     for i in range(nb_train_frames):
         plt.imsave(
             f"./training_views/img_idx_{i}.png",
-            training_dataset[i * 400 * 400 : (i + 1) * 400 * 400, 6:]
-            .reshape(400, 400, 3)
+            training_dataset[i * image_h * image_w : (i + 1) * image_h * image_w, 6:]
+            .reshape(image_h, image_w, 3)
             .cpu()
             .numpy(),
         )
@@ -365,8 +316,8 @@ if __name__ == "__main__":
     for i in range(nb_test_frames):
         plt.imsave(
             f"./testing_views/img_idx_{i}.png",
-            testing_dataset[i * 400 * 400 : (i + 1) * 400 * 400, 6:]
-            .reshape(400, 400, 3)
+            testing_dataset[i * image_h * image_w : (i + 1) * image_h * image_w, 6:]
+            .reshape(image_h, image_w, 3)
             .cpu()
             .numpy(),
         )
@@ -381,28 +332,7 @@ if __name__ == "__main__":
         model_optimizer, milestones=[2, 4, 8], gamma=0.5
     )
     data_loader = DataLoader(
-        training_dataset, batch_size=2048, shuffle=True, num_workers=4
-    )
-    # render_fn = functools.partial(_viewer_render_fn, local_nerf_model=model)
-    render_fn = _viewer_render_fn
-    SERVER = viser.ViserServer(port=8080)
-    SERVER.scene.world_axes.visible = True
-    SERVER.scene.set_up_direction("-z")
-    for i in range(nb_train_frames):
-        img_view_position = training_dataset[i * 400 * 400, :3].cpu().numpy()
-        SERVER.scene.add_image(
-            f"training_img_{i}",
-            imageio.imread(f"./training_views/img_idx_{i}.png"),
-            render_height=4.0,
-            render_width=4.0,
-            format="png",
-            position=img_view_position,
-            visible=False,
-        )
-    VIEWER = nerfview.viewer.Viewer(
-        SERVER,
-        render_fn=render_fn,
-        mode="training",
+        training_dataset, batch_size=128, shuffle=True, num_workers=4
     )
     # HN: near plane distance, HF: far plane distance
     # 2 and 6 are the values used for this dataset
@@ -416,7 +346,6 @@ if __name__ == "__main__":
         hn=2,
         hf=6,
         nb_bins=192,
-        H=400,
-        W=400,
-        viewer=VIEWER,
+        H=image_h,
+        W=image_w,
     )
