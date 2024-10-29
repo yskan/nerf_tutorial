@@ -13,4 +13,10 @@ pip install numpy==1.24.1 matplotlib ipympl imageio ipywidgets tqdm
 ```
 
 ## Usage
-Open nerf.ipynb in Jupyter Notebook and run the cells.
+Open `nerf.ipynb` in Jupyter Notebook and run the cells.
+
+## Explore further
+
+Check out [Nerf Studio](https://nerf.studio/) for a more interactive experience.
+
+Check out [LightGaussianSplatting](https://github.com/VITA-Group/LightGaussian) for a peek at gaussian splatting.
